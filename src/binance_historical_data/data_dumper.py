@@ -29,7 +29,7 @@ class BinanceDataDumper:
     _DICT_DATA_TYPES_BY_ASSET = {
         "spot": ("aggTrades", "klines", "trades"),
         "cm": ("aggTrades", "klines", "trades", "indexPriceKlines", "markPriceKlines", "premiumIndexKlines"),
-        "um": ("aggTrades", "klines", "trades", "indexPriceKlines", "markPriceKlines", "premiumIndexKlines", "metrics")
+        "um": ("aggTrades", "klines", "trades", "indexPriceKlines", "markPriceKlines", "premiumIndexKlines", "metrics","bookDepth")
     }
     _DATA_FREQUENCY_NEEDED_FOR_TYPE = ("klines", "indexPriceKlines", "markPriceKlines", "premiumIndexKlines")
     _DATA_FREQUENCY_ENUM = ('1s','1m', '3m', '5m', '15m', '30m', '1h', '2h', '4h', '6h', '8h', '12h',
@@ -135,9 +135,10 @@ class BinanceDataDumper:
         LOGGER.info("---> End Date: %s", date_end.strftime("%Y%m%d"))
         date_end_first_day_of_month = datetime.date(
             year=date_end.year, month=date_end.month, day=1)
+        ONLY_DAILY_DATA_TYPES = ["metrics","bookDepth"]
         for ticker in tqdm(list_trading_pairs, leave=True, desc="Tickers"):
             # 1) Download all monthly data
-            if self._data_type != "metrics" and (date_end_first_day_of_month - relativedelta(days=1) > date_start):
+            if self._data_type not in ONLY_DAILY_DATA_TYPES and (date_end_first_day_of_month - relativedelta(days=1) > date_start):
                 self._download_data_for_1_ticker(
                     ticker=ticker,
                     date_start=date_start,
@@ -145,8 +146,10 @@ class BinanceDataDumper:
                     timeperiod_per_file="monthly",
                     is_to_update_existing=is_to_update_existing,
                 )
-            # 2) Download all daily date
-            if self._data_type == "metrics":
+                # 对于monthly数据，不下载daily数据
+                continue
+            # 2) Download all daily date，因为metrics和bookDepth只有daily数据
+            if self._data_type in ONLY_DAILY_DATA_TYPES:
                 date_start_daily = date_start
             else:
                 date_start_daily = date_end_first_day_of_month
