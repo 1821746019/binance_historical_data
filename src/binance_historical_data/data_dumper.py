@@ -26,10 +26,12 @@ LOGGER = logging.getLogger(__name__)
 class BinanceDataDumper:
     _FUTURES_ASSET_CLASSES = ("um", "cm")
     _ASSET_CLASSES = ("spot",)
+    _OPTION_ASSET_CLASSES = ("option",)
     _DICT_DATA_TYPES_BY_ASSET = {
         "spot": ("aggTrades", "klines", "trades"),
         "cm": ("aggTrades", "klines", "trades", "indexPriceKlines", "markPriceKlines", "premiumIndexKlines"),
-        "um": ("aggTrades", "klines", "trades", "indexPriceKlines", "markPriceKlines", "premiumIndexKlines", "metrics","bookDepth")
+        "um": ("aggTrades", "klines", "trades", "indexPriceKlines", "markPriceKlines", "premiumIndexKlines", "metrics","bookDepth"),
+        "option": ("BVOLIndex", "EOHSummary"),
     }
     _DATA_FREQUENCY_NEEDED_FOR_TYPE = ("klines", "indexPriceKlines", "markPriceKlines", "premiumIndexKlines")
     _DATA_FREQUENCY_ENUM = ('1s','1m', '3m', '5m', '15m', '30m', '1h', '2h', '4h', '6h', '8h', '12h',
@@ -52,10 +54,10 @@ class BinanceDataDumper:
                 Data frequency. [1m, 3m, 5m, 15m, 30m, 1h, 2h, 4h, 6h, 8h, 12h]
                 Defaults to "1m".
         """
-        if asset_class not in (self._ASSET_CLASSES + self._FUTURES_ASSET_CLASSES):
+        if asset_class not in (self._ASSET_CLASSES + self._FUTURES_ASSET_CLASSES + self._OPTION_ASSET_CLASSES):
             raise ValueError(
                 f"Unknown asset class: {asset_class} "
-                f"not in {self._ASSET_CLASSES + self._FUTURES_ASSET_CLASSES}")
+                f"not in {self._ASSET_CLASSES + self._FUTURES_ASSET_CLASSES + self._OPTION_ASSET_CLASSES}")
 
         if data_type not in self._DICT_DATA_TYPES_BY_ASSET[asset_class]:
             raise ValueError(
@@ -135,7 +137,7 @@ class BinanceDataDumper:
         LOGGER.info("---> End Date: %s", date_end.strftime("%Y%m%d"))
         date_end_first_day_of_month = datetime.date(
             year=date_end.year, month=date_end.month, day=1)
-        ONLY_DAILY_DATA_TYPES = ["metrics","bookDepth"]
+        ONLY_DAILY_DATA_TYPES = ["metrics","bookDepth", "BVOLIndex", "EOHSummary"]
         for ticker in tqdm(list_trading_pairs, leave=True, desc="Tickers"):
             # 1) Download all monthly data
             if self._data_type not in ONLY_DAILY_DATA_TYPES and (date_end_first_day_of_month - relativedelta(days=1) > date_start):
@@ -177,9 +179,23 @@ class BinanceDataDumper:
             response = urllib.request.urlopen(f"https://fapi.binance.{tld}/fapi/v1/exchangeInfo").read()
         elif self._asset_class == 'cm':
             response = urllib.request.urlopen(f"https://dapi.binance.{tld}/dapi/v1/exchangeInfo").read()
+        elif self._asset_class == 'option':
+            response = urllib.request.urlopen(f"https://eapi.binance.{tld}/eapi/v1/exchangeInfo").read()
         else:
             # https://api.binance.us/api/v3/exchangeInfo
             response = urllib.request.urlopen(f"https://api.binance.{tld}/api/v3/exchangeInfo").read()
+        if self._asset_class == 'option':
+            symbol_map = {
+                'BVOLIndex': ['BTCBVOLUSDT','ETHBVOLUSDT'],
+                'BOHSummary': ['BNBUSDT','BTCUSDT','DOGEUSDT','ETHUSDT','XRPUSDT']
+            }
+            return symbol_map[self._data_type]
+        # 得到的是形如BTC-250926-60000-P的symbol，没有上面的
+            # return list(map(
+            #     lambda symbol: symbol['symbol'],
+            #     json.loads(response)['optionSymbols']
+            # ))
+
         return list(map(
             lambda symbol: symbol['symbol'],
             json.loads(response)['symbols']
