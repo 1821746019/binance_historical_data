@@ -1,7 +1,9 @@
 """Module with class to download candle historical data from binance"""
 # Standard library imports
+import io
 import os
 import re
+import time
 import urllib.request
 import xml.etree.ElementTree as ET
 import json
@@ -16,11 +18,103 @@ from dateutil.relativedelta import relativedelta
 from tqdm.auto import tqdm
 from char import char
 from mpire import WorkerPool
+import pandas as pd
+import pyarrow.csv as pv
+import pyarrow.parquet as pq
 
 # Local imports
+from .kline_patcher import patch_pyarrow_kline_table, interval_to_milliseconds
 
 # Global constants
 LOGGER = logging.getLogger(__name__)
+
+DEFAULT_HEADERS = {
+    "klines": {
+        12: [
+            "open_time", "open", "high", "low", "close", "volume",
+            "close_time", "quote_volume", "count", "taker_buy_volume",
+            "taker_buy_quote_volume", "ignore",
+        ],
+        11: [
+            "open_time", "open", "high", "low", "close", "volume",
+            "close_time", "quote_volume", "count", "taker_buy_volume",
+            "taker_buy_quote_volume",
+        ],
+    },
+    "indexPriceKlines": {
+        12: [
+            "open_time", "open", "high", "low", "close", "volume",
+            "close_time", "quote_volume", "count", "taker_buy_volume",
+            "taker_buy_quote_volume", "ignore",
+        ],
+        11: [
+            "open_time", "open", "high", "low", "close", "volume",
+            "close_time", "quote_volume", "count", "taker_buy_volume",
+            "taker_buy_quote_volume",
+        ],
+    },
+    "markPriceKlines": {
+        12: [
+            "open_time", "open", "high", "low", "close", "volume",
+            "close_time", "quote_volume", "count", "taker_buy_volume",
+            "taker_buy_quote_volume", "ignore",
+        ],
+        11: [
+            "open_time", "open", "high", "low", "close", "volume",
+            "close_time", "quote_volume", "count", "taker_buy_volume",
+            "taker_buy_quote_volume",
+        ],
+    },
+    "premiumIndexKlines": {
+        12: [
+            "open_time", "open", "high", "low", "close", "volume",
+            "close_time", "quote_volume", "count", "taker_buy_volume",
+            "taker_buy_quote_volume", "ignore",
+        ],
+        11: [
+            "open_time", "open", "high", "low", "close", "volume",
+            "close_time", "quote_volume", "count", "taker_buy_volume",
+            "taker_buy_quote_volume",
+        ],
+    },
+    "aggTrades": {
+        7: [
+            "agg_trade_id", "price", "quantity", "first_trade_id",
+            "last_trade_id", "transact_time", "is_buyer_maker",
+        ],
+        8: [
+            "agg_trade_id", "price", "quantity", "first_trade_id",
+            "last_trade_id", "transact_time", "is_buyer_maker", "is_best_match",
+        ],
+    },
+    "trades": {
+        5: ["id", "price", "qty", "quote_qty", "time"],
+        6: ["id", "price", "qty", "quote_qty", "time", "is_buyer_maker"],
+        7: [
+            "id", "price", "qty", "quote_qty", "time",
+            "is_buyer_maker", "is_best_match",
+        ],
+    },
+    "bookTicker": {
+        7: [
+            "update_id", "best_bid_price", "best_bid_qty",
+            "best_ask_price", "best_ask_qty", "transaction_time", "event_time",
+        ],
+    },
+    "bookDepth": {
+        4: ["timestamp", "percentage", "depth", "notional"],
+    },
+    "metrics": {
+        8: [
+            "create_time", "symbol", "sum_open_interest", "sum_open_interest_value",
+            "count_toptrader_long_short_ratio", "sum_toptrader_long_short_ratio",
+            "count_long_short_ratio", "sum_taker_long_short_vol_ratio",
+        ],
+    },
+    "BVOLIndex": {
+        3: ["calc_time", "symbol", "index_value"],
+    },
+}
 
 
 class BinanceDataDumper:
@@ -36,13 +130,15 @@ class BinanceDataDumper:
     _DATA_FREQUENCY_NEEDED_FOR_TYPE = ("klines", "indexPriceKlines", "markPriceKlines", "premiumIndexKlines")
     _DATA_FREQUENCY_ENUM = ('1s','1m', '3m', '5m', '15m', '30m', '1h', '2h', '4h', '6h', '8h', '12h',
                             '1d', '3d', '1w', '1mo')
-
+    ONLY_DAILY_DATA_TYPES = ["metrics", "bookDepth", "BVOLIndex", "EOHSummary"]
     def __init__(
             self,
             path_dir_where_to_dump,
             asset_class="spot",  # spot, um, cm
             data_type="klines",  # aggTrades, klines, trades
             data_frequency="1m",  # argument for data_type="klines"
+            file_format="parquet",  # parquet, csv
+            patch_gaps: bool = True,  # 自动检测并补齐缺失的K线
     ) -> None:
         """Init object to dump all data from binance servers
 
@@ -53,6 +149,9 @@ class BinanceDataDumper:
             data_frequency (str): \
                 Data frequency. [1m, 3m, 5m, 15m, 30m, 1h, 2h, 4h, 6h, 8h, 12h]
                 Defaults to "1m".
+            file_format (str): \
+                File format to save data. [parquet, csv]
+                Defaults to "parquet".
         """
         if asset_class not in (self._ASSET_CLASSES + self._FUTURES_ASSET_CLASSES + self._OPTION_ASSET_CLASSES):
             raise ValueError(
@@ -63,6 +162,11 @@ class BinanceDataDumper:
             raise ValueError(
                 f"Unknown data type: {data_type} "
                 f"not in {self._DICT_DATA_TYPES_BY_ASSET[asset_class]}")
+
+        if file_format not in ("parquet", "csv"):
+            raise ValueError(
+                f"Unknown file format: {file_format} "
+                f"not in ('parquet', 'csv')")
 
         if data_type in self._DATA_FREQUENCY_NEEDED_FOR_TYPE:
             if data_frequency not in self._DATA_FREQUENCY_ENUM:
@@ -78,6 +182,8 @@ class BinanceDataDumper:
         self._base_url = "https://data.binance.vision/data"
         self._asset_class = asset_class
         self._data_type = data_type
+        self._file_format = file_format
+        self._patch_gaps = patch_gaps
 
 
 
@@ -137,10 +243,9 @@ class BinanceDataDumper:
         LOGGER.info("---> End Date: %s", date_end.strftime("%Y%m%d"))
         date_end_first_day_of_month = datetime.date(
             year=date_end.year, month=date_end.month, day=1)
-        ONLY_DAILY_DATA_TYPES = ["metrics","bookDepth", "BVOLIndex", "EOHSummary"]
         for ticker in tqdm(list_trading_pairs, leave=True, desc="Tickers"):
             # 1) Download all monthly data
-            if self._data_type not in ONLY_DAILY_DATA_TYPES and (date_end_first_day_of_month - relativedelta(days=1) > date_start):
+            if self._data_type not in self.ONLY_DAILY_DATA_TYPES and (date_end_first_day_of_month - relativedelta(days=1) > date_start):
                 self._download_data_for_1_ticker(
                     ticker=ticker,
                     date_start=date_start,
@@ -151,7 +256,7 @@ class BinanceDataDumper:
                 # 对于monthly数据，不下载daily数据
                 continue
             # 2) Download all daily date，因为metrics和bookDepth只有daily数据
-            if self._data_type in ONLY_DAILY_DATA_TYPES:
+            if self._data_type in self.ONLY_DAILY_DATA_TYPES:
                 date_start_daily = date_start
             else:
                 date_start_daily = date_end_first_day_of_month
@@ -290,9 +395,11 @@ class BinanceDataDumper:
             ticker,
             date_obj,
             timeperiod_per_file="monthly",
-            extension="csv",
+            extension=None,
     ):
         """Create file name in the format it's named on the binance server"""
+        if extension is None:
+            extension = self._file_format
 
         if timeperiod_per_file == "monthly":
             str_date = date_obj.strftime("%Y-%m")
@@ -332,12 +439,22 @@ class BinanceDataDumper:
                 ticker,
                 date_obj,
                 timeperiod_per_file=timeperiod_per_file,
-                extension="csv",
+                extension=self._file_format,
             )
             path_where_to_save = os.path.join(
                 str_dir_where_to_save, file_name)
             if os.path.exists(path_where_to_save):
                 list_dates_with_data.append(date_obj)
+            else:
+                alt_ext = "csv" if self._file_format == "parquet" else "parquet"
+                alt_file_name = self.create_filename(
+                    ticker,
+                    date_obj,
+                    timeperiod_per_file=timeperiod_per_file,
+                    extension=alt_ext,
+                )
+                if os.path.exists(os.path.join(str_dir_where_to_save, alt_file_name)):
+                    list_dates_with_data.append(date_obj)
 
         return list_dates_with_data
 
@@ -385,20 +502,23 @@ class BinanceDataDumper:
                     ticker,
                     timeperiod_per_file="daily",
                 )
-                str_filename = self.create_filename(
-                    ticker,
-                    date_saved_day,
-                    timeperiod_per_file="daily",
-                    extension="csv",
-                )
-                try:
-                    os.remove(os.path.join(str_folder, str_filename))
-                    dict_files_deleted_by_ticker[ticker] += 1
-                except Exception:
-                    LOGGER.warning(
-                        "Unable to delete file: %s",
-                        os.path.join(str_folder, str_filename)
+                for ext in set([self._file_format, "parquet", "csv"]):
+                    str_filename = self.create_filename(
+                        ticker,
+                        date_saved_day,
+                        timeperiod_per_file="daily",
+                        extension=ext,
                     )
+                    file_to_del = os.path.join(str_folder, str_filename)
+                    if os.path.exists(file_to_del):
+                        try:
+                            os.remove(file_to_del)
+                            dict_files_deleted_by_ticker[ticker] += 1
+                        except Exception:
+                            LOGGER.warning(
+                                "Unable to delete file: %s",
+                                file_to_del
+                            )
         LOGGER.info(
             "---> Done. Daily files deleted for %d tickers",
             len(dict_files_deleted_by_ticker)
@@ -495,8 +615,7 @@ class BinanceDataDumper:
             date_obj,
             timeperiod_per_file="monthly",
     ):
-        """Dump data for 1 ticker for 1 data"""
-        # 1) Create path to file to save
+        """Dump data for 1 ticker for 1 date with retry and streaming support"""
         path_folder_suffix = self._get_path_suffix_to_dir_with_data(
             timeperiod_per_file, ticker)
         file_name = self.create_filename(
@@ -509,29 +628,238 @@ class BinanceDataDumper:
             self.path_dir_where_to_dump, path_folder_suffix)
         path_zip_raw_file = os.path.join(
             str_dir_where_to_save, file_name)
-        # 2) Create URL to file to download
         url_file_to_download = os.path.join(
             self._base_url, path_folder_suffix, file_name)
-        # 3) Download file and unzip it
-        if not self._download_raw_file(url_file_to_download, path_zip_raw_file):
-            return None
-        # 4) Extract zip archive
-        try:
-            with zipfile.ZipFile(path_zip_raw_file, 'r') as zip_ref:
-                zip_ref.extractall(os.path.dirname(path_zip_raw_file))
-        except Exception as ex:
-            LOGGER.warning(
-                "Unable to unzip file %s with error: %s", path_zip_raw_file, ex)
-            return None
-        # 5) Delete the zip archive
-        try:
-            os.remove(path_zip_raw_file)
-        except Exception as ex:
-            LOGGER.warning(
-                "Unable to delete zip file %s with error: %s",
-                path_zip_raw_file, ex)
-            return None
-        return date_obj
+
+        max_retries = 3
+        for attempt in range(1, max_retries + 1):
+            if not self._download_raw_file(url_file_to_download, path_zip_raw_file):
+                # 404 or non-existent file on server, no need to retry
+                return None
+
+            try:
+                with zipfile.ZipFile(path_zip_raw_file, 'r') as zip_ref:
+                    # Check CRC-32 integrity of zip entries
+                    bad_file = zip_ref.testzip()
+                    if bad_file:
+                        raise zipfile.BadZipFile(f"Corrupt CRC-32 in entry: {bad_file}")
+
+                    for name in zip_ref.namelist():
+                        if not name.endswith(".csv"):
+                            continue
+                        if self._file_format == "parquet":
+                            out_parquet = os.path.join(
+                                str_dir_where_to_save, name[:-4] + ".parquet")
+                            self._convert_zip_entry_to_parquet(
+                                zip_ref=zip_ref,
+                                entry_name=name,
+                                parquet_file_path=out_parquet,
+                                data_type=self._data_type,
+                                ticker=ticker,
+                                interval=self._data_frequency,
+                                asset_class=self._asset_class,
+                                date_obj=date_obj,
+                                timeperiod_per_file=timeperiod_per_file,
+                                enable_patch=self._patch_gaps,
+                            )
+                        else:
+                            out_csv = os.path.join(str_dir_where_to_save, name)
+                            if self._patch_gaps and self._data_type in ("klines", "premiumIndexKlines", "indexPriceKlines", "markPriceKlines"):
+                                self._convert_zip_entry_to_csv_with_patch(
+                                    zip_ref=zip_ref,
+                                    entry_name=name,
+                                    csv_file_path=out_csv,
+                                    data_type=self._data_type,
+                                    ticker=ticker,
+                                    interval=self._data_frequency,
+                                    asset_class=self._asset_class,
+                                    date_obj=date_obj,
+                                    timeperiod_per_file=timeperiod_per_file,
+                                )
+                            else:
+                                with zip_ref.open(name) as src, open(out_csv, "wb") as dst:
+                                    while chunk := src.read(1024 * 1024):
+                                        dst.write(chunk)
+                # Success
+                return date_obj
+            except Exception as ex:
+                if attempt < max_retries:
+                    LOGGER.warning(
+                        "Attempt %d/%d failed for %s (%s). Retrying download...",
+                        attempt, max_retries, file_name, ex
+                    )
+                    time.sleep(1.5 * attempt)
+                else:
+                    LOGGER.warning(
+                        "All %d attempts failed for %s with error: %s",
+                        max_retries, file_name, ex
+                    )
+                    return None
+            finally:
+                if os.path.exists(path_zip_raw_file):
+                    try:
+                        os.remove(path_zip_raw_file)
+                    except Exception:
+                        pass
+        return None
+
+    @staticmethod
+    def _convert_zip_entry_to_parquet(
+            zip_ref: zipfile.ZipFile,
+            entry_name: str,
+            parquet_file_path: str,
+            data_type: str = "",
+            ticker: str = "",
+            interval: str = "",
+            asset_class: str = "um",
+            date_obj = None,
+            timeperiod_per_file: str = "monthly",
+            enable_patch: bool = True,
+    ):
+        """Convert Binance CSV inside Zip directly to Parquet using PyArrow streaming parser with gap patching."""
+        with zip_ref.open(entry_name) as f:
+            first_line = f.readline().decode("utf-8", errors="ignore").strip()
+
+        if not first_line:
+            pd.DataFrame().to_parquet(parquet_file_path, engine="pyarrow", index=False)
+            return
+
+        tokens = [t.strip() for t in first_line.split(",")]
+        num_cols = len(tokens)
+
+        known_header_tokens = {
+            "open_time", "open", "agg_trade_id", "id", "timestamp",
+            "create_time", "calc_time", "update_id", "time", "date",
+            "symbol", "transact_time", "price",
+        }
+        has_header = False
+        if tokens[0].lower() in known_header_tokens:
+            has_header = True
+        else:
+            clean_first = tokens[0].replace(".", "").replace("-", "").replace(":", "").replace(" ", "")
+            if not clean_first.isdigit() and any(c.isalpha() for c in tokens[0]):
+                has_header = True
+
+        if has_header:
+            with zip_ref.open(entry_name) as f:
+                table = pv.read_csv(f)
+        else:
+            type_headers = DEFAULT_HEADERS.get(data_type, {})
+            if num_cols in type_headers:
+                names = type_headers[num_cols]
+            else:
+                names = [f"col_{i}" for i in range(num_cols)]
+            ro = pv.ReadOptions(column_names=names, autogenerate_column_names=False)
+            with zip_ref.open(entry_name) as f:
+                table = pv.read_csv(f, read_options=ro)
+
+        if enable_patch and data_type in ("klines", "premiumIndexKlines", "indexPriceKlines", "markPriceKlines") and interval:
+            start_time = None
+            end_time = None
+            if date_obj is not None:
+                if timeperiod_per_file == "monthly":
+                    start_time = datetime.datetime(date_obj.year, date_obj.month, 1, tzinfo=datetime.timezone.utc)
+                    next_month = start_time + relativedelta(months=1)
+                    step_ms = interval_to_milliseconds(interval) if interval_to_milliseconds else 60_000
+                    now_utc = datetime.datetime.now(datetime.timezone.utc)
+                    end_time = min(next_month - datetime.timedelta(milliseconds=step_ms), now_utc)
+                elif timeperiod_per_file == "daily":
+                    start_time = datetime.datetime(date_obj.year, date_obj.month, date_obj.day, tzinfo=datetime.timezone.utc)
+                    next_day = start_time + datetime.timedelta(days=1)
+                    step_ms = interval_to_milliseconds(interval) if interval_to_milliseconds else 60_000
+                    now_utc = datetime.datetime.now(datetime.timezone.utc)
+                    end_time = min(next_day - datetime.timedelta(milliseconds=step_ms), now_utc)
+
+            table = patch_pyarrow_kline_table(
+                table=table,
+                ticker=ticker,
+                interval=interval,
+                asset_class=asset_class,
+                data_type=data_type,
+                start_time=start_time,
+                end_time=end_time,
+            )
+
+        pq.write_table(table, parquet_file_path, compression="snappy")
+
+    @classmethod
+    def _convert_zip_entry_to_csv_with_patch(
+            cls,
+            zip_ref: zipfile.ZipFile,
+            entry_name: str,
+            csv_file_path: str,
+            data_type: str = "",
+            ticker: str = "",
+            interval: str = "",
+            asset_class: str = "um",
+            date_obj = None,
+            timeperiod_per_file: str = "monthly",
+    ):
+        """Convert Binance CSV inside Zip, apply patch and save as CSV."""
+        with zip_ref.open(entry_name) as f:
+            first_line = f.readline().decode("utf-8", errors="ignore").strip()
+
+        if not first_line:
+            with open(csv_file_path, "w", encoding="utf-8") as f:
+                f.write("")
+            return
+
+        tokens = [t.strip() for t in first_line.split(",")]
+        num_cols = len(tokens)
+
+        known_header_tokens = {
+            "open_time", "open", "agg_trade_id", "id", "timestamp",
+            "create_time", "calc_time", "update_id", "time", "date",
+            "symbol", "transact_time", "price",
+        }
+        has_header = False
+        if tokens[0].lower() in known_header_tokens:
+            has_header = True
+        else:
+            clean_first = tokens[0].replace(".", "").replace("-", "").replace(":", "").replace(" ", "")
+            if not clean_first.isdigit() and any(c.isalpha() for c in tokens[0]):
+                has_header = True
+
+        if has_header:
+            with zip_ref.open(entry_name) as f:
+                table = pv.read_csv(f)
+        else:
+            type_headers = DEFAULT_HEADERS.get(data_type, {})
+            if num_cols in type_headers:
+                names = type_headers[num_cols]
+            else:
+                names = [f"col_{i}" for i in range(num_cols)]
+            ro = pv.ReadOptions(column_names=names, autogenerate_column_names=False)
+            with zip_ref.open(entry_name) as f:
+                table = pv.read_csv(f, read_options=ro)
+
+        start_time = None
+        end_time = None
+        if date_obj is not None:
+            if timeperiod_per_file == "monthly":
+                start_time = datetime.datetime(date_obj.year, date_obj.month, 1, tzinfo=datetime.timezone.utc)
+                next_month = start_time + relativedelta(months=1)
+                step_ms = interval_to_milliseconds(interval) if interval_to_milliseconds else 60_000
+                now_utc = datetime.datetime.now(datetime.timezone.utc)
+                end_time = min(next_month - datetime.timedelta(milliseconds=step_ms), now_utc)
+            elif timeperiod_per_file == "daily":
+                start_time = datetime.datetime(date_obj.year, date_obj.month, date_obj.day, tzinfo=datetime.timezone.utc)
+                next_day = start_time + datetime.timedelta(days=1)
+                step_ms = interval_to_milliseconds(interval) if interval_to_milliseconds else 60_000
+                now_utc = datetime.datetime.now(datetime.timezone.utc)
+                end_time = min(next_day - datetime.timedelta(milliseconds=step_ms), now_utc)
+
+        table = patch_pyarrow_kline_table(
+            table=table,
+            ticker=ticker,
+            interval=interval,
+            asset_class=asset_class,
+            data_type=data_type,
+            start_time=start_time,
+            end_time=end_time,
+        )
+
+        pv.write_csv(table, csv_file_path)
 
     def _get_path_suffix_to_dir_with_data(self, timeperiod_per_file, ticker):
         """_summary_
@@ -558,33 +886,76 @@ class BinanceDataDumper:
 
     @staticmethod
     def _download_raw_file(str_url_path_to_file, str_path_where_to_save):
-        """Download file from binance server by URL"""
+        """Download file from binance server by URL with streaming and verification"""
 
         LOGGER.debug("Download file from: %s", str_url_path_to_file)
         str_url_path_to_file = str_url_path_to_file.replace("\\", "/")
         try:
-            if "trades" not in str_url_path_to_file.lower():
-                urllib.request.urlretrieve(str_url_path_to_file, str_path_where_to_save)
-            else:  # only show progress bar for trades data as the files are usually big
-                with tqdm(unit="B", unit_scale=True, miniters=1,
-                          desc="downloading: " + str_url_path_to_file.split("/")[-1]) as progress_bar:
-                    def progress_hook(count, block_size, total_size):
-                        current_size = block_size * count
-                        previous_progress = progress_bar.n / total_size * 100
-                        current_progress = current_size / total_size * 100
+            req = urllib.request.Request(
+                str_url_path_to_file,
+                headers={"User-Agent": "Mozilla/5.0"}
+            )
+            with urllib.request.urlopen(req, timeout=120) as response:
+                content_length = response.headers.get("Content-Length")
+                expected_size = int(content_length) if content_length else None
 
-                        if current_progress > previous_progress + 10:
-                            progress_bar.total = total_size
-                            progress_bar.update(current_size - progress_bar.n)
+                show_progress = "trades" in str_url_path_to_file.lower()
+                chunk_size = 1024 * 1024  # 1MB
+                downloaded_size = 0
 
-                    urllib.request.urlretrieve(
-                        str_url_path_to_file, str_path_where_to_save, progress_hook)
+                pbar = None
+                if show_progress:
+                    pbar = tqdm(
+                        total=expected_size,
+                        unit="B",
+                        unit_scale=True,
+                        miniters=1,
+                        desc="downloading: " + str_url_path_to_file.split("/")[-1],
+                    )
+
+                with open(str_path_where_to_save, "wb") as f:
+                    while True:
+                        chunk = response.read(chunk_size)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        downloaded_size += len(chunk)
+                        if pbar:
+                            pbar.update(len(chunk))
+
+                if pbar:
+                    pbar.close()
+
+                if expected_size is not None and downloaded_size != expected_size:
+                    raise IOError(
+                        f"Incomplete download: received {downloaded_size} bytes out of {expected_size}"
+                    )
+        except urllib.error.HTTPError as ex:
+            if ex.code == 404:
+                LOGGER.debug("[WARNING] File not found: %s", str_url_path_to_file)
+            else:
+                LOGGER.warning("HTTP error %s downloading %s: %s", ex.code, str_url_path_to_file, ex)
+            if os.path.exists(str_path_where_to_save):
+                try:
+                    os.remove(str_path_where_to_save)
+                except Exception:
+                    pass
+            return 0
         except urllib.error.URLError as ex:
-            LOGGER.debug(
-                "[WARNING] File not found: %s", str_url_path_to_file)
+            LOGGER.debug("[WARNING] URL error: %s - %s", str_url_path_to_file, ex)
+            if os.path.exists(str_path_where_to_save):
+                try:
+                    os.remove(str_path_where_to_save)
+                except Exception:
+                    pass
             return 0
         except Exception as ex:
-            LOGGER.warning("Unable to download raw file: %s", ex)
+            LOGGER.warning("Unable to download raw file %s: %s", str_url_path_to_file, ex)
+            if os.path.exists(str_path_where_to_save):
+                try:
+                    os.remove(str_path_where_to_save)
+                except Exception:
+                    pass
             return 0
         return 1
 
