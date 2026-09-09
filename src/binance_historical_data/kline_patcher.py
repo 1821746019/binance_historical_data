@@ -136,6 +136,7 @@ def detect_kline_gaps(
     timestamp_col: str = "open_time",
     start_time: Optional[Union[int, datetime.datetime, datetime.date, str]] = None,
     end_time: Optional[Union[int, datetime.datetime, datetime.date, str]] = None,
+    internal_only: bool = True,
 ) -> List[Tuple[int, int]]:
     """
     检测 K 线 DataFrame 中缺失的时间戳区间。
@@ -144,8 +145,11 @@ def detect_kline_gaps(
         df: 包含时间戳列的 DataFrame
         interval: K线频率，例如 '1m', '5m', '1h'
         timestamp_col: 时间戳列名，默认为 'open_time'
-        start_time: 期望的起点时间（可选），若数据第一根K线晚于此时间，将记录头部缺失
-        end_time: 期望的终点时间（可选），若数据最后一根K线早于此时间，将记录尾部缺失
+        start_time: 期望的起点时间（可选），若 internal_only=False 且数据第一根K线晚于此时间，将记录头部缺失
+        end_time: 期望的终点时间（可选），若 internal_only=False 且数据最后一根K线早于此时间，将记录尾部缺失
+        internal_only: 是否仅检测中间内部断层（默认为 True）。
+                       在量化中，头部/尾部缺失通常是因为代币当月中旬才上市或退市停牌，
+                       盲目补齐会把未上市时间当缺失并触发大量无效 REST 请求。设为 True 则只补齐交易序列内部的断层。
 
     返回:
         gaps: 缺失区间列表，每个元素为 (gap_start_ms, gap_end_ms)（闭区间）
@@ -157,7 +161,7 @@ def detect_kline_gaps(
     end_ms = _normalize_timestamp_to_ms(end_time) if end_time is not None else None
 
     if df.empty or timestamp_col not in df.columns:
-        if start_ms is not None and end_ms is not None and start_ms <= end_ms:
+        if not internal_only and start_ms is not None and end_ms is not None and start_ms <= end_ms:
             return [(start_ms, end_ms)]
         return gaps
 
@@ -169,16 +173,16 @@ def detect_kline_gaps(
 
     sorted_ts = ts_values.drop_duplicates().sort_values().to_numpy()
     if len(sorted_ts) == 0:
-        if start_ms is not None and end_ms is not None and start_ms <= end_ms:
+        if not internal_only and start_ms is not None and end_ms is not None and start_ms <= end_ms:
             return [(start_ms, end_ms)]
         return gaps
 
-    # 1. 检查头部缺失
+    # 1. 检查头部缺失（仅在 internal_only=False 时检测）
     first_ts = int(sorted_ts[0])
-    if start_ms is not None and start_ms < first_ts:
+    if not internal_only and start_ms is not None and start_ms < first_ts:
         gaps.append((start_ms, first_ts - step_ms))
 
-    # 2. 检查中间断层
+    # 2. 检查中间断层（核心断层：两次交易时间差大于一个 step）
     diffs = sorted_ts[1:] - sorted_ts[:-1]
     gap_indices = (diffs > step_ms).nonzero()[0]
     for idx in gap_indices:
@@ -187,9 +191,9 @@ def detect_kline_gaps(
         if gap_start <= gap_end:
             gaps.append((gap_start, gap_end))
 
-    # 3. 检查尾部缺失
+    # 3. 检查尾部缺失（仅在 internal_only=False 时检测）
     last_ts = int(sorted_ts[-1])
-    if end_ms is not None and last_ts < end_ms:
+    if not internal_only and end_ms is not None and last_ts < end_ms:
         gaps.append((last_ts + step_ms, end_ms))
 
     return gaps
@@ -328,6 +332,7 @@ def fill_kline_gaps(
     end_time: Optional[Union[int, datetime.datetime, datetime.date, str]] = None,
     timestamp_col: str = "open_time",
     session: Optional[requests.Session] = None,
+    internal_only: bool = True,
 ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     """
     通用 K 线数据缺失检测与自动补齐主函数。
@@ -342,6 +347,7 @@ def fill_kline_gaps(
         end_time: 期望的结束时间（可选）
         timestamp_col: 时间戳列名，默认为 "open_time"
         session: 可选的 requests.Session 实例
+        internal_only: 是否仅补齐中间断层（默认为 True，不将未上市或退市阶段误判为缺失）
 
     返回:
         (repaired_df, report)
@@ -361,6 +367,7 @@ def fill_kline_gaps(
         timestamp_col=timestamp_col,
         start_time=start_time,
         end_time=end_time,
+        internal_only=internal_only,
     )
     report["gaps_detected"] = gaps
 
@@ -454,6 +461,7 @@ def patch_pyarrow_kline_table(
     data_type: str = "klines",
     start_time: Optional[Union[int, datetime.datetime, datetime.date, str]] = None,
     end_time: Optional[Union[int, datetime.datetime, datetime.date, str]] = None,
+    internal_only: bool = True,
 ) -> pa.Table:
     """
     针对 PyArrow Table 对象就地执行 K 线缺失检测与 API 补齐，返回补齐后的 PyArrow Table。
@@ -474,6 +482,7 @@ def patch_pyarrow_kline_table(
         start_time=start_time,
         end_time=end_time,
         timestamp_col="open_time",
+        internal_only=internal_only,
     )
 
     if report["is_modified"]:
@@ -498,6 +507,7 @@ def patch_kline_file(
     start_time: Optional[Union[int, datetime.datetime, datetime.date, str]] = None,
     end_time: Optional[Union[int, datetime.datetime, datetime.date, str]] = None,
     backup: bool = False,
+    internal_only: bool = True,
 ) -> Dict[str, Any]:
     """
     对磁盘上的单个 Parquet / CSV K 线文件进行检查并补齐修复。
@@ -521,6 +531,7 @@ def patch_kline_file(
         data_type=data_type,
         start_time=start_time,
         end_time=end_time,
+        internal_only=internal_only,
     )
 
     if report["is_modified"]:

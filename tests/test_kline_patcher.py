@@ -65,12 +65,18 @@ def test_detect_kline_gaps_with_boundaries():
     # 指定超出数据范围的全局起点和终点
     start_bound = base_ts - 2 * step
     end_bound = base_ts + 11 * step
-    gaps = detect_kline_gaps(df, "5m", start_time=start_bound, end_time=end_bound)
 
-    assert len(gaps) == 3
-    assert gaps[0] == (start_bound, base_ts - step)  # 头部缺失
-    assert gaps[1] == (base_ts + 2 * step, base_ts + 3 * step)  # 中间缺失
-    assert gaps[2] == (base_ts + 10 * step, end_bound)  # 尾部缺失
+    # 默认 internal_only=True: 忽略未上市头部与退市尾部，仅捕获序列中间真正断裂的数据
+    gaps_internal = detect_kline_gaps(df, "5m", start_time=start_bound, end_time=end_bound)
+    assert len(gaps_internal) == 1
+    assert gaps_internal[0] == (base_ts + 2 * step, base_ts + 3 * step)
+
+    # 显式 internal_only=False: 检测全量包含头尾边界
+    gaps_all = detect_kline_gaps(df, "5m", start_time=start_bound, end_time=end_bound, internal_only=False)
+    assert len(gaps_all) == 3
+    assert gaps_all[0] == (start_bound, base_ts - step)  # 头部缺失
+    assert gaps_all[1] == (base_ts + 2 * step, base_ts + 3 * step)  # 中间缺失
+    assert gaps_all[2] == (base_ts + 10 * step, end_bound)  # 尾部缺失
 
 
 def test_detect_kline_gaps_no_gaps():
