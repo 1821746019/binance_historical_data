@@ -77,6 +77,9 @@ KLINE_DATA_TYPES = {
     "markPriceKlines",
 }
 
+# 记录已确认下架、不存在或无法通过 REST API 补齐的标的熔断黑名单，避免后续重复无意义重试与超时
+_UNAVAILABLE_SYMBOLS: set = set()
+
 
 def interval_to_milliseconds(interval: str) -> int:
     """
@@ -137,6 +140,7 @@ def detect_kline_gaps(
     start_time: Optional[Union[int, datetime.datetime, datetime.date, str]] = None,
     end_time: Optional[Union[int, datetime.datetime, datetime.date, str]] = None,
     internal_only: bool = True,
+    gap_mode: Literal["internal", "all"] = "internal",
 ) -> List[Tuple[int, int]]:
     """
     检测 K 线 DataFrame 中缺失的时间戳区间。
@@ -145,11 +149,12 @@ def detect_kline_gaps(
         df: 包含时间戳列的 DataFrame
         interval: K线频率，例如 '1m', '5m', '1h'
         timestamp_col: 时间戳列名，默认为 'open_time'
-        start_time: 期望的起点时间（可选），若 internal_only=False 且数据第一根K线晚于此时间，将记录头部缺失
-        end_time: 期望的终点时间（可选），若 internal_only=False 且数据最后一根K线早于此时间，将记录尾部缺失
-        internal_only: 是否仅检测中间内部断层（默认为 True）。
-                       在量化中，头部/尾部缺失通常是因为代币当月中旬才上市或退市停牌，
-                       盲目补齐会把未上市时间当缺失并触发大量无效 REST 请求。设为 True 则只补齐交易序列内部的断层。
+        start_time: 期望的起点时间（可选），若 gap_mode='all' 且数据第一根K线晚于此时间，将记录头部缺失
+        end_time: 期望的终点时间（可选），若 gap_mode='all' 且数据最后一根K线早于此时间，将记录尾部缺失
+        internal_only: 兼容旧版参数，默认为 True。
+        gap_mode: 补齐模式，默认为 'internal'（仅补齐中间断层）。
+                  'internal': 仅检测已有数据区间内部的断层，严禁把上市前（左侧）与退市后（右侧）当成缺失去补；
+                  'all': 包含头尾外部边界。
 
     返回:
         gaps: 缺失区间列表，每个元素为 (gap_start_ms, gap_end_ms)（闭区间）
@@ -157,11 +162,14 @@ def detect_kline_gaps(
     step_ms = interval_to_milliseconds(interval)
     gaps: List[Tuple[int, int]] = []
 
+    # 补齐模式判定：若显式指定了 gap_mode='all' 或 internal_only=False 则开启全量模式；默认全为 internal (中间补齐)
+    is_internal = False if (gap_mode == "all" or not internal_only) else True
+
     start_ms = _normalize_timestamp_to_ms(start_time) if start_time is not None else None
     end_ms = _normalize_timestamp_to_ms(end_time) if end_time is not None else None
 
     if df.empty or timestamp_col not in df.columns:
-        if not internal_only and start_ms is not None and end_ms is not None and start_ms <= end_ms:
+        if not is_internal and start_ms is not None and end_ms is not None and start_ms <= end_ms:
             return [(start_ms, end_ms)]
         return gaps
 
@@ -173,13 +181,13 @@ def detect_kline_gaps(
 
     sorted_ts = ts_values.drop_duplicates().sort_values().to_numpy()
     if len(sorted_ts) == 0:
-        if not internal_only and start_ms is not None and end_ms is not None and start_ms <= end_ms:
+        if not is_internal and start_ms is not None and end_ms is not None and start_ms <= end_ms:
             return [(start_ms, end_ms)]
         return gaps
 
-    # 1. 检查头部缺失（仅在 internal_only=False 时检测）
+    # 1. 检查头部缺失（仅在全量模式 is_internal=False 时检测）
     first_ts = int(sorted_ts[0])
-    if not internal_only and start_ms is not None and start_ms < first_ts:
+    if not is_internal and start_ms is not None and start_ms < first_ts:
         gaps.append((start_ms, first_ts - step_ms))
 
     # 2. 检查中间断层（核心断层：两次交易时间差大于一个 step）
@@ -191,9 +199,9 @@ def detect_kline_gaps(
         if gap_start <= gap_end:
             gaps.append((gap_start, gap_end))
 
-    # 3. 检查尾部缺失（仅在 internal_only=False 时检测）
+    # 3. 检查尾部缺失（仅在全量模式 is_internal=False 时检测）
     last_ts = int(sorted_ts[-1])
-    if not internal_only and end_ms is not None and last_ts < end_ms:
+    if not is_internal and end_ms is not None and last_ts < end_ms:
         gaps.append((last_ts + step_ms, end_ms))
 
     return gaps
@@ -248,6 +256,11 @@ def fetch_klines_range(
     if start_time_ms > end_time_ms:
         return pd.DataFrame(columns=KLINE_COLUMNS)
 
+    sym_upper = symbol.upper()
+    if sym_upper in _UNAVAILABLE_SYMBOLS:
+        LOGGER.debug("标的 %s 已在不可用/退市熔断名单中，跳过 API 补齐请求", sym_upper)
+        return pd.DataFrame(columns=KLINE_COLUMNS)
+
     endpoint, limit = _get_api_endpoint(asset_class, data_type)
     step_ms = interval_to_milliseconds(interval)
     http = session or requests.Session()
@@ -257,7 +270,7 @@ def fetch_klines_range(
 
     while current_start <= end_time_ms:
         params = {
-            "symbol": symbol.upper(),
+            "symbol": sym_upper,
             "interval": interval,
             "startTime": current_start,
             "endTime": end_time_ms,
@@ -273,6 +286,15 @@ def fetch_klines_range(
                     batch_data = resp.json()
                     success = True
                     break
+                elif resp.status_code in (400, 404):
+                    LOGGER.warning(
+                        "请求 API 返回 %d (%s)，标的 %s 可能已退市或不存在，加入跳过黑名单，不再重试",
+                        resp.status_code,
+                        resp.text[:120],
+                        sym_upper,
+                    )
+                    _UNAVAILABLE_SYMBOLS.add(sym_upper)
+                    break
                 elif resp.status_code in (429, 418):
                     retry_after = int(resp.headers.get("Retry-After", 2 * attempt))
                     LOGGER.warning(
@@ -284,14 +306,17 @@ def fetch_klines_range(
                         "请求 API 出错 %s, 状态码: %d, 响应: %s",
                         endpoint,
                         resp.status_code,
-                        resp.text,
+                        resp.text[:120],
                     )
                     time.sleep(1.0 * attempt)
             except Exception as e:
                 LOGGER.warning("请求 API 异常: %s (重试 %d/%d)", e, attempt, max_retries)
                 time.sleep(1.0 * attempt)
 
-        if not success or not batch_data:
+        if not success:
+            break
+
+        if not batch_data:
             break
 
         all_rows.extend(batch_data)
@@ -347,6 +372,7 @@ def fill_kline_gaps(
     timestamp_col: str = "open_time",
     session: Optional[requests.Session] = None,
     internal_only: bool = True,
+    gap_mode: Literal["internal", "all"] = "internal",
 ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     """
     通用 K 线数据缺失检测与自动补齐主函数。
@@ -361,7 +387,8 @@ def fill_kline_gaps(
         end_time: 期望的结束时间（可选）
         timestamp_col: 时间戳列名，默认为 "open_time"
         session: 可选的 requests.Session 实例
-        internal_only: 是否仅补齐中间断层（默认为 True，不将未上市或退市阶段误判为缺失）
+        internal_only: 兼容旧版参数，默认为 True
+        gap_mode: 补齐模式，默认为 'internal'（仅补齐中间断层，禁止上市前/退市后无效外推）
 
     返回:
         (repaired_df, report)
@@ -382,6 +409,7 @@ def fill_kline_gaps(
         start_time=start_time,
         end_time=end_time,
         internal_only=internal_only,
+        gap_mode=gap_mode,
     )
     report["gaps_detected"] = gaps
 
@@ -488,6 +516,7 @@ def patch_pyarrow_kline_table(
     start_time: Optional[Union[int, datetime.datetime, datetime.date, str]] = None,
     end_time: Optional[Union[int, datetime.datetime, datetime.date, str]] = None,
     internal_only: bool = True,
+    gap_mode: Literal["internal", "all"] = "internal",
 ) -> pa.Table:
     """
     针对 PyArrow Table 对象就地执行 K 线缺失检测与 API 补齐，返回补齐后的 PyArrow Table。
@@ -509,6 +538,7 @@ def patch_pyarrow_kline_table(
         end_time=end_time,
         timestamp_col="open_time",
         internal_only=internal_only,
+        gap_mode=gap_mode,
     )
 
     if report["is_modified"]:
@@ -534,6 +564,7 @@ def patch_kline_file(
     end_time: Optional[Union[int, datetime.datetime, datetime.date, str]] = None,
     backup: bool = False,
     internal_only: bool = True,
+    gap_mode: Literal["internal", "all"] = "internal",
 ) -> Dict[str, Any]:
     """
     对磁盘上的单个 Parquet / CSV K 线文件进行检查并补齐修复。
@@ -558,6 +589,7 @@ def patch_kline_file(
         start_time=start_time,
         end_time=end_time,
         internal_only=internal_only,
+        gap_mode=gap_mode,
     )
 
     if report["is_modified"]:

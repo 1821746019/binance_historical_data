@@ -1,4 +1,5 @@
 import os
+import unittest.mock
 
 import pandas as pd
 import pyarrow as pa
@@ -12,6 +13,55 @@ from binance_historical_data import (
     patch_kline_file,
     patch_pyarrow_kline_table,
 )
+
+
+@pytest.fixture(autouse=True)
+def mock_binance_api():
+    def _fake_get(url, params=None, timeout=15):
+        class FakeResponse:
+            def __init__(self, data, status_code=200):
+                self._data = data
+                self.status_code = status_code
+                self.text = str(data)
+                self.headers = {}
+
+            def json(self):
+                return self._data
+
+        sym = params.get("symbol", "") if params else ""
+        if "INVALID" in sym:
+            return FakeResponse({"code": -1121, "msg": "Invalid symbol."}, status_code=400)
+
+        start = int(params.get("startTime", 0)) if params else 0
+        end = int(params.get("endTime", 0)) if params else 0
+        step = 300_000
+        bars = []
+        cur = start
+        while cur <= end and len(bars) < 1500:
+            bars.append(
+                [
+                    cur,
+                    "100.0",
+                    "105.0",
+                    "95.0",
+                    "102.0",
+                    "10.0",
+                    cur + step - 1,
+                    "1000.0",
+                    50,
+                    "5.0",
+                    "500.0",
+                    "0",
+                ]
+            )
+            cur += step
+        return FakeResponse(bars, status_code=200)
+
+    with (
+        unittest.mock.patch("requests.Session.get", side_effect=_fake_get),
+        unittest.mock.patch("requests.get", side_effect=_fake_get),
+    ):
+        yield
 
 
 @pytest.mark.parametrize(
@@ -203,3 +253,38 @@ def test_patch_kline_file(tmp_path):
     df_fixed = pd.read_parquet(file_path)
     assert len(df_fixed) == 8
     assert detect_kline_gaps(df_fixed, "5m") == []
+
+
+def test_detect_kline_gaps_internal_mode_ignores_boundaries():
+    """验证 gap_mode='internal' 默认模式下绝对不向上市前（左侧）或退市后（右侧）外推"""
+    base_ts = 1704067200000
+    step = 300_000  # 5m
+    # 模拟在 base_ts 处上市，且中间缺失 1 根 (第 2 根)
+    times = [base_ts, base_ts + step, base_ts + 3 * step, base_ts + 4 * step]
+    df = pd.DataFrame({"open_time": times, "close": [100.0] * len(times)})
+
+    # 人为传入整月的月初和月末边界
+    start_bound = base_ts - 100 * step
+    end_bound = base_ts + 100 * step
+
+    # 默认模式 gap_mode='internal'，必须完全忽略头尾，仅检出内部的一处断层
+    gaps_internal = detect_kline_gaps(df, "5m", start_time=start_bound, end_time=end_bound, gap_mode="internal")
+    assert len(gaps_internal) == 1
+    assert gaps_internal[0] == (base_ts + 2 * step, base_ts + 2 * step)
+
+
+def test_circuit_breaker_on_delisted_symbol():
+    """验证退市或非法标的能迅速熔断并跳过后续无意义的 API 请求"""
+    from binance_historical_data.kline_patcher import _UNAVAILABLE_SYMBOLS
+
+    fake_symbol = "TOTALLY_INVALID_COIN_XYZ_USDT"
+    assert fake_symbol not in _UNAVAILABLE_SYMBOLS
+
+    # 首次调用触发 400 非法标的错误，应自动记录到熔断黑名单
+    df_empty = fetch_klines_range(fake_symbol, "1h", 1704067200000, 1704070800000, max_retries=1)
+    assert df_empty.empty
+    assert fake_symbol in _UNAVAILABLE_SYMBOLS
+
+    # 再次调用应瞬间返回空 DataFrame，不需要发起网络请求
+    df_second = fetch_klines_range(fake_symbol, "1h", 1704067200000, 1704070800000, max_retries=1)
+    assert df_second.empty
