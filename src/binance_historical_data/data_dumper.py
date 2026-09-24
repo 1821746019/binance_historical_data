@@ -891,6 +891,7 @@ class BinanceDataDumper:
         LOGGER.debug("Download file from: %s", str_url_path_to_file)
         str_url_path_to_file = str_url_path_to_file.replace("\\", "/")
         try:
+            os.makedirs(os.path.dirname(str_path_where_to_save), exist_ok=True)
             req = urllib.request.Request(
                 str_url_path_to_file,
                 headers={"User-Agent": "Mozilla/5.0"}

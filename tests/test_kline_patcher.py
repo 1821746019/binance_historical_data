@@ -4,7 +4,6 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
-
 from binance_historical_data import (
     detect_kline_gaps,
     fetch_klines_range,
@@ -72,7 +71,9 @@ def test_detect_kline_gaps_with_boundaries():
     assert gaps_internal[0] == (base_ts + 2 * step, base_ts + 3 * step)
 
     # 显式 internal_only=False: 检测全量包含头尾边界
-    gaps_all = detect_kline_gaps(df, "5m", start_time=start_bound, end_time=end_bound, internal_only=False)
+    gaps_all = detect_kline_gaps(
+        df, "5m", start_time=start_bound, end_time=end_bound, internal_only=False
+    )
     assert len(gaps_all) == 3
     assert gaps_all[0] == (start_bound, base_ts - step)  # 头部缺失
     assert gaps_all[1] == (base_ts + 2 * step, base_ts + 3 * step)  # 中间缺失

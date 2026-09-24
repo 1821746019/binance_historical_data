@@ -275,10 +275,17 @@ def fetch_klines_range(
                     break
                 elif resp.status_code in (429, 418):
                     retry_after = int(resp.headers.get("Retry-After", 2 * attempt))
-                    LOGGER.warning("触发 Binance 限频 (%d)，休眠 %d 秒后重试...", resp.status_code, retry_after)
+                    LOGGER.warning(
+                        "触发 Binance 限频 (%d)，休眠 %d 秒后重试...", resp.status_code, retry_after
+                    )
                     time.sleep(retry_after)
                 else:
-                    LOGGER.warning("请求 API 出错 %s, 状态码: %d, 响应: %s", endpoint, resp.status_code, resp.text)
+                    LOGGER.warning(
+                        "请求 API 出错 %s, 状态码: %d, 响应: %s",
+                        endpoint,
+                        resp.status_code,
+                        resp.text,
+                    )
                     time.sleep(1.0 * attempt)
             except Exception as e:
                 LOGGER.warning("请求 API 异常: %s (重试 %d/%d)", e, attempt, max_retries)
@@ -309,15 +316,22 @@ def fetch_klines_range(
         if col in KLINE_DTYPES:
             target_type = KLINE_DTYPES[col]
             if target_type == "int64":
-                df_fetched[col] = pd.to_numeric(df_fetched[col], errors="coerce").fillna(0).astype("int64")
+                df_fetched[col] = (
+                    pd.to_numeric(df_fetched[col], errors="coerce").fillna(0).astype("int64")
+                )
             elif target_type == "float64":
                 df_fetched[col] = pd.to_numeric(df_fetched[col], errors="coerce").astype("float64")
             elif target_type == "str":
                 df_fetched[col] = df_fetched[col].astype(str)
 
-    df_fetched = df_fetched[
-        (df_fetched["open_time"] >= start_time_ms) & (df_fetched["open_time"] <= end_time_ms)
-    ].drop_duplicates(subset=["open_time"]).sort_values("open_time").reset_index(drop=True)
+    df_fetched = (
+        df_fetched[
+            (df_fetched["open_time"] >= start_time_ms) & (df_fetched["open_time"] <= end_time_ms)
+        ]
+        .drop_duplicates(subset=["open_time"])
+        .sort_values("open_time")
+        .reset_index(drop=True)
+    )
 
     return df_fetched
 
@@ -410,8 +424,12 @@ def fill_kline_gaps(
         return df, report
 
     df_orig = df.copy()
-    if timestamp_col in df_orig.columns and not pd.api.types.is_integer_dtype(df_orig[timestamp_col]):
-        df_orig[timestamp_col] = df_orig[timestamp_col].apply(_normalize_timestamp_to_ms).astype("int64")
+    if timestamp_col in df_orig.columns and not pd.api.types.is_integer_dtype(
+        df_orig[timestamp_col]
+    ):
+        df_orig[timestamp_col] = (
+            df_orig[timestamp_col].apply(_normalize_timestamp_to_ms).astype("int64")
+        )
 
     aligned_fetched_dfs = []
     for fdf in fetched_dfs:
@@ -420,9 +438,15 @@ def fill_kline_gaps(
             if col in fdf.columns:
                 try:
                     if pd.api.types.is_integer_dtype(df_orig[col]):
-                        aligned_df[col] = pd.to_numeric(fdf[col], errors="coerce").fillna(0).astype(df_orig[col].dtype)
+                        aligned_df[col] = (
+                            pd.to_numeric(fdf[col], errors="coerce")
+                            .fillna(0)
+                            .astype(df_orig[col].dtype)
+                        )
                     elif pd.api.types.is_float_dtype(df_orig[col]):
-                        aligned_df[col] = pd.to_numeric(fdf[col], errors="coerce").astype(df_orig[col].dtype)
+                        aligned_df[col] = pd.to_numeric(fdf[col], errors="coerce").astype(
+                            df_orig[col].dtype
+                        )
                     elif pd.api.types.is_string_dtype(df_orig[col]) or df_orig[col].dtype == object:
                         aligned_df[col] = fdf[col].astype(str)
                     else:
@@ -442,7 +466,9 @@ def fill_kline_gaps(
 
     for col in df_orig.columns:
         try:
-            if pd.api.types.is_integer_dtype(df_orig[col]) or pd.api.types.is_float_dtype(df_orig[col]):
+            if pd.api.types.is_integer_dtype(df_orig[col]) or pd.api.types.is_float_dtype(
+                df_orig[col]
+            ):
                 combined_df[col] = combined_df[col].astype(df_orig[col].dtype)
             elif pd.api.types.is_string_dtype(df_orig[col]) or df_orig[col].dtype == object:
                 combined_df[col] = combined_df[col].astype(str)
