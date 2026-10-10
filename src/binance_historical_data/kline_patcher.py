@@ -174,10 +174,8 @@ def detect_kline_gaps(
         return gaps
 
     ts_series = df[timestamp_col]
-    if not pd.api.types.is_integer_dtype(ts_series):
-        ts_values = ts_series.apply(_normalize_timestamp_to_ms).astype("int64")
-    else:
-        ts_values = ts_series.astype("int64")
+    # 无论原始序列是纳秒、微秒还是毫秒，统一归一化为 UTC 毫秒时间戳进行断层与步长计算
+    ts_values = ts_series.apply(_normalize_timestamp_to_ms).astype("int64")
 
     sorted_ts = ts_values.drop_duplicates().sort_values().to_numpy()
     if len(sorted_ts) == 0:
@@ -452,9 +450,7 @@ def fill_kline_gaps(
         return df, report
 
     df_orig = df.copy()
-    if timestamp_col in df_orig.columns and not pd.api.types.is_integer_dtype(
-        df_orig[timestamp_col]
-    ):
+    if timestamp_col in df_orig.columns:
         df_orig[timestamp_col] = (
             df_orig[timestamp_col].apply(_normalize_timestamp_to_ms).astype("int64")
         )
