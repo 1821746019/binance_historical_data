@@ -754,15 +754,31 @@ class BinanceDataDumper:
                 table = pv.read_csv(f, read_options=ro)
 
         if enable_patch and data_type in ("klines", "premiumIndexKlines", "indexPriceKlines", "markPriceKlines") and interval:
-            # 严格仅执行中间断层补齐，绝不向 API 索要币种上市前（左）或退市后（右）的不存在数据
+            # 计算当月/当日归档切片在自然周期内的理论起止时间
+            # 只有当文件内已有数据真实跨越该时间段时，智能补齐引擎才会对官方切片截断引起的头尾断层发起精准补齐
+            calc_start_time = None
+            calc_end_time = None
+            if date_obj is not None:
+                step_ms = interval_to_milliseconds(interval) if interval_to_milliseconds else 60_000
+                now_utc = datetime.datetime.now(datetime.timezone.utc)
+                if timeperiod_per_file == "monthly":
+                    calc_start_time = datetime.datetime(date_obj.year, date_obj.month, 1, tzinfo=datetime.timezone.utc)
+                    next_month = calc_start_time + relativedelta(months=1)
+                    calc_end_time = min(next_month - datetime.timedelta(milliseconds=step_ms), now_utc)
+                elif timeperiod_per_file == "daily":
+                    calc_start_time = datetime.datetime(date_obj.year, date_obj.month, date_obj.day, tzinfo=datetime.timezone.utc)
+                    next_day = calc_start_time + datetime.timedelta(days=1)
+                    calc_end_time = min(next_day - datetime.timedelta(milliseconds=step_ms), now_utc)
+
             table = patch_pyarrow_kline_table(
                 table=table,
                 ticker=ticker,
                 interval=interval,
                 asset_class=asset_class,
                 data_type=data_type,
-                internal_only=True,
-                gap_mode="internal",
+                start_time=calc_start_time,
+                end_time=calc_end_time,
+                gap_mode="auto",
             )
 
         pq.write_table(table, parquet_file_path, compression="snappy")
@@ -818,15 +834,29 @@ class BinanceDataDumper:
             with zip_ref.open(entry_name) as f:
                 table = pv.read_csv(f, read_options=ro)
 
-        # 严格仅执行中间断层补齐，绝不向 API 索要币种上市前（左）或退市后（右）的不存在数据
+        calc_start_time = None
+        calc_end_time = None
+        if date_obj is not None:
+            step_ms = interval_to_milliseconds(interval) if interval_to_milliseconds else 60_000
+            now_utc = datetime.datetime.now(datetime.timezone.utc)
+            if timeperiod_per_file == "monthly":
+                calc_start_time = datetime.datetime(date_obj.year, date_obj.month, 1, tzinfo=datetime.timezone.utc)
+                next_month = calc_start_time + relativedelta(months=1)
+                calc_end_time = min(next_month - datetime.timedelta(milliseconds=step_ms), now_utc)
+            elif timeperiod_per_file == "daily":
+                calc_start_time = datetime.datetime(date_obj.year, date_obj.month, date_obj.day, tzinfo=datetime.timezone.utc)
+                next_day = calc_start_time + datetime.timedelta(days=1)
+                calc_end_time = min(next_day - datetime.timedelta(milliseconds=step_ms), now_utc)
+
         table = patch_pyarrow_kline_table(
             table=table,
             ticker=ticker,
             interval=interval,
             asset_class=asset_class,
             data_type=data_type,
-            internal_only=True,
-            gap_mode="internal",
+            start_time=calc_start_time,
+            end_time=calc_end_time,
+            gap_mode="auto",
         )
 
         pv.write_csv(table, csv_file_path)

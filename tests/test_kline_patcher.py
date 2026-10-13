@@ -34,7 +34,8 @@ def mock_binance_api():
 
         start = int(params.get("startTime", 0)) if params else 0
         end = int(params.get("endTime", 0)) if params else 0
-        step = 300_000
+        interval_req = params.get("interval", "5m") if params else "5m"
+        step = interval_to_milliseconds(interval_req)
         bars = []
         cur = start
         while cur <= end and len(bars) < 1500:
@@ -288,3 +289,100 @@ def test_circuit_breaker_on_delisted_symbol():
     # 再次调用应瞬间返回空 DataFrame，不需要发起网络请求
     df_second = fetch_klines_range(fake_symbol, "1h", 1704067200000, 1704070800000, max_retries=1)
     assert df_second.empty
+
+
+def test_auto_gap_mode_patches_monthly_slice_boundaries():
+    """
+    【踩坑实录复现测试】
+    复现 2022-02 末（官方归档提前至 02-25 20:00 截断）与
+    2022-04 初（官方归档滞后至 04-03 00:00 开始）的边界切片 Bug。
+    验证 gap_mode='auto' 传入自然月起止时间时，能够精准检测并补全头尾缺口。
+    """
+    # 模拟 2022-02 (4h K线, 理论应有 28天 * 6 = 168 根)
+    # 归档仅给到了 02-25 20:00 (共 150 根, 缺失 02-26 00:00 至 02-28 20:00 共 18 根)
+    base_ts = 1643673600000  # 2022-02-01 00:00:00 UTC
+    step = 14_400_000  # 4h
+    times_02 = [base_ts + i * step for i in range(150)]
+    df_02 = pd.DataFrame(
+        {
+            "open_time": times_02,
+            "open": [10.0] * 150,
+            "high": [11.0] * 150,
+            "low": [9.0] * 150,
+            "close": [10.5] * 150,
+            "volume": [100.0] * 150,
+            "close_time": [t + step - 1 for t in times_02],
+            "quote_volume": [1000.0] * 150,
+            "count": [50] * 150,
+            "taker_buy_volume": [50.0] * 150,
+            "taker_buy_quote_volume": [500.0] * 150,
+            "ignore": [0] * 150,
+        }
+    )
+
+    # 1. 如果使用纯内部模式，因 150 根数据内部完全连续，检出 0 处断层 (导致漏补)
+    gaps_pure_internal = detect_kline_gaps(df_02, "4h", gap_mode="internal")
+    assert len(gaps_pure_internal) == 0
+
+    # 2. 当传入当月理论起止时间且使用 gap_mode='auto' 时，精准捕获尾部缺失的 18 根 bar
+    month_start_ms = base_ts
+    month_end_ms = base_ts + 167 * step  # 2022-02-28 20:00:00 UTC
+    gaps_auto_02 = detect_kline_gaps(
+        df_02, "4h", start_time=month_start_ms, end_time=month_end_ms, gap_mode="auto"
+    )
+    assert len(gaps_auto_02) == 1
+    expected_gap_start = base_ts + 150 * step
+    expected_gap_end = month_end_ms
+    assert gaps_auto_02[0] == (expected_gap_start, expected_gap_end)
+    assert (expected_gap_end - expected_gap_start) // step + 1 == 18
+
+    # 3. 验证 patch_pyarrow_kline_table 在 auto 模式下能自动补齐到满额 168 根
+    table_02 = pa.Table.from_pandas(df_02, preserve_index=False)
+    patched_table_02 = patch_pyarrow_kline_table(
+        table=table_02,
+        ticker="WAVESUSDT",
+        interval="4h",
+        asset_class="um",
+        data_type="klines",
+        start_time=month_start_ms,
+        end_time=month_end_ms,
+        gap_mode="auto",
+    )
+    df_fixed_02 = patched_table_02.to_pandas()
+    assert len(df_fixed_02) == 168
+    assert df_fixed_02["open_time"].iloc[-1] == month_end_ms
+
+    # 4. 模拟 2022-04 (官方切片从 04-03 00:00 才开始, 缺失月初 12 根)
+    april_start_ms = 1648771200000  # 2022-04-01 00:00:00 UTC
+    times_04 = [april_start_ms + i * step for i in range(12, 180)]  # 缺少前 12 根
+    df_04 = pd.DataFrame(
+        {
+            "open_time": times_04,
+            "open": [50.0] * len(times_04),
+            "high": [55.0] * len(times_04),
+            "low": [45.0] * len(times_04),
+            "close": [52.0] * len(times_04),
+            "volume": [200.0] * len(times_04),
+            "close_time": [t + step - 1 for t in times_04],
+            "quote_volume": [2000.0] * len(times_04),
+            "count": [80] * len(times_04),
+            "taker_buy_volume": [80.0] * len(times_04),
+            "taker_buy_quote_volume": [800.0] * len(times_04),
+            "ignore": [0] * len(times_04),
+        }
+    )
+    april_end_ms = april_start_ms + 179 * step
+    table_04 = pa.Table.from_pandas(df_04, preserve_index=False)
+    patched_table_04 = patch_pyarrow_kline_table(
+        table=table_04,
+        ticker="WAVESUSDT",
+        interval="4h",
+        asset_class="um",
+        data_type="klines",
+        start_time=april_start_ms,
+        end_time=april_end_ms,
+        gap_mode="auto",
+    )
+    df_fixed_04 = patched_table_04.to_pandas()
+    assert len(df_fixed_04) == 180
+    assert df_fixed_04["open_time"].iloc[0] == april_start_ms

@@ -6,10 +6,12 @@ K线数据缺失检测与 Binance REST API 补齐模块
 """
 
 import datetime
+import io
 import logging
 import os
 import re
 import time
+import zipfile
 from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
 import pandas as pd
@@ -140,7 +142,7 @@ def detect_kline_gaps(
     start_time: Optional[Union[int, datetime.datetime, datetime.date, str]] = None,
     end_time: Optional[Union[int, datetime.datetime, datetime.date, str]] = None,
     internal_only: bool = True,
-    gap_mode: Literal["internal", "all"] = "internal",
+    gap_mode: Literal["internal", "all", "auto"] = "internal",
 ) -> List[Tuple[int, int]]:
     """
     检测 K 线 DataFrame 中缺失的时间戳区间。
@@ -149,12 +151,14 @@ def detect_kline_gaps(
         df: 包含时间戳列的 DataFrame
         interval: K线频率，例如 '1m', '5m', '1h'
         timestamp_col: 时间戳列名，默认为 'open_time'
-        start_time: 期望的起点时间（可选），若 gap_mode='all' 且数据第一根K线晚于此时间，将记录头部缺失
-        end_time: 期望的终点时间（可选），若 gap_mode='all' 且数据最后一根K线早于此时间，将记录尾部缺失
+        start_time: 期望的起点时间（可选），当 gap_mode 为 'all' 或 'auto' 时使用
+        end_time: 期望的终点时间（可选），当 gap_mode 为 'all' 或 'auto' 时使用
         internal_only: 兼容旧版参数，默认为 True。
-        gap_mode: 补齐模式，默认为 'internal'（仅补齐中间断层）。
-                  'internal': 仅检测已有数据区间内部的断层，严禁把上市前（左侧）与退市后（右侧）当成缺失去补；
-                  'all': 包含头尾外部边界。
+        gap_mode: 补齐模式，默认为 'internal'。
+                  'auto': 智能模式。当传入 start_time/end_time 时，自动检查并补齐
+                          位于代币有效生命周期内的头尾边界缺口（如 Vision 官方切片 Bug 导致的月末提前截断与月初延迟滞后）；
+                  'internal': 仅检测已有数据区间内部的断层，严禁任何头尾外推；
+                  'all': 无条件包含头尾外部边界。
 
     返回:
         gaps: 缺失区间列表，每个元素为 (gap_start_ms, gap_end_ms)（闭区间）
@@ -162,8 +166,13 @@ def detect_kline_gaps(
     step_ms = interval_to_milliseconds(interval)
     gaps: List[Tuple[int, int]] = []
 
-    # 补齐模式判定：若显式指定了 gap_mode='all' 或 internal_only=False 则开启全量模式；默认全为 internal (中间补齐)
-    is_internal = False if (gap_mode == "all" or not internal_only) else True
+    # 补齐模式判定
+    if gap_mode == "auto":
+        is_internal = False if (start_time is not None or end_time is not None) else True
+    elif gap_mode == "all" or not internal_only:
+        is_internal = False
+    else:  # internal
+        is_internal = True
 
     start_ms = _normalize_timestamp_to_ms(start_time) if start_time is not None else None
     end_ms = _normalize_timestamp_to_ms(end_time) if end_time is not None else None
@@ -183,7 +192,7 @@ def detect_kline_gaps(
             return [(start_ms, end_ms)]
         return gaps
 
-    # 1. 检查头部缺失（仅在全量模式 is_internal=False 时检测）
+    # 1. 检查头部缺失（在非纯内部模式下检测）
     first_ts = int(sorted_ts[0])
     if not is_internal and start_ms is not None and start_ms < first_ts:
         gaps.append((start_ms, first_ts - step_ms))
@@ -197,7 +206,7 @@ def detect_kline_gaps(
         if gap_start <= gap_end:
             gaps.append((gap_start, gap_end))
 
-    # 3. 检查尾部缺失（仅在全量模式 is_internal=False 时检测）
+    # 3. 检查尾部缺失（在非纯内部模式下检测）
     last_ts = int(sorted_ts[-1])
     if not is_internal and end_ms is not None and last_ts < end_ms:
         gaps.append((last_ts + step_ms, end_ms))
@@ -359,6 +368,78 @@ def fetch_klines_range(
     return df_fetched
 
 
+def fetch_klines_from_vision_daily(
+    symbol: str,
+    interval: str,
+    start_time_ms: int,
+    end_time_ms: int,
+    asset_class: Literal["spot", "um", "cm"] = "um",
+    data_type: str = "klines",
+    session: Optional[requests.Session] = None,
+) -> pd.DataFrame:
+    """
+    当 REST API 无法返回数据时（如历史二次上线导致板载时间重置的币种），
+    自动回退至 Binance Vision 的日度归档 ZIP 包下载并拼接缺失时间范围。
+    """
+    http = session or requests.Session()
+    dt_cur = datetime.datetime.fromtimestamp(start_time_ms / 1000, tz=datetime.timezone.utc).date()
+    dt_end = datetime.datetime.fromtimestamp(end_time_ms / 1000, tz=datetime.timezone.utc).date()
+
+    all_dfs = []
+    base_prefix = f"https://data.binance.vision/data/{'futures/' + asset_class if asset_class in ('um', 'cm') else 'spot'}/daily/{data_type}/{symbol.upper()}"
+    if interval:
+        base_prefix = f"{base_prefix}/{interval}"
+
+    while dt_cur <= dt_end:
+        str_date = dt_cur.strftime("%Y-%m-%d")
+        file_name = f"{symbol.upper()}-{interval if interval else data_type}-{str_date}.zip"
+        url = f"{base_prefix}/{file_name}"
+
+        try:
+            resp = http.get(url, timeout=10)
+            if resp.status_code == 200:
+                with zipfile.ZipFile(io.BytesIO(resp.content)) as z:
+                    for name in z.namelist():
+                        if name.endswith(".csv"):
+                            with z.open(name) as f:
+                                df_day = pd.read_csv(f, header=None)
+                                cols = KLINE_COLUMNS[: df_day.shape[1]]
+                                df_day.columns = cols
+                                all_dfs.append(df_day)
+        except Exception as e:
+            LOGGER.debug("Vision 日度归档回退尝试 %s 失败: %s", url, e)
+
+        dt_cur += datetime.timedelta(days=1)
+
+    if not all_dfs:
+        return pd.DataFrame(columns=KLINE_COLUMNS)
+
+    df_combined = pd.concat(all_dfs, ignore_index=True)
+    for col in df_combined.columns:
+        if col in KLINE_DTYPES:
+            target_type = KLINE_DTYPES[col]
+            if target_type == "int64":
+                df_combined[col] = (
+                    pd.to_numeric(df_combined[col], errors="coerce").fillna(0).astype("int64")
+                )
+            elif target_type == "float64":
+                df_combined[col] = (
+                    pd.to_numeric(df_combined[col], errors="coerce").astype("float64")
+                )
+            elif target_type == "str":
+                df_combined[col] = df_combined[col].astype(str)
+
+    df_combined = (
+        df_combined[
+            (df_combined["open_time"] >= start_time_ms) & (df_combined["open_time"] <= end_time_ms)
+        ]
+        .drop_duplicates(subset=["open_time"])
+        .sort_values("open_time")
+        .reset_index(drop=True)
+    )
+    return df_combined
+
+
 def fill_kline_gaps(
     df: pd.DataFrame,
     symbol: str,
@@ -438,6 +519,21 @@ def fill_kline_gaps(
             session=session,
         )
 
+        # 若 API 数据缺失，尝试从 Binance Vision 日度归档中无缝兜底补齐
+        if len(df_gap) < expected_bars:
+            LOGGER.debug("[%s] API 数据不完整 (%d/%d)，尝试 Vision 日度归档兜底...", symbol, len(df_gap), expected_bars)
+            df_vision = fetch_klines_from_vision_daily(
+                symbol=symbol,
+                interval=interval,
+                start_time_ms=gap_start,
+                end_time_ms=gap_end,
+                asset_class=asset_class,
+                data_type=data_type,
+                session=session,
+            )
+            if not df_vision.empty:
+                df_gap = pd.concat([df_gap, df_vision], ignore_index=True).drop_duplicates(subset=["open_time"]).sort_values("open_time").reset_index(drop=True)
+
         if not df_gap.empty:
             fetched_dfs.append(df_gap)
             report["filled_bars_count"] += len(df_gap)
@@ -512,7 +608,7 @@ def patch_pyarrow_kline_table(
     start_time: Optional[Union[int, datetime.datetime, datetime.date, str]] = None,
     end_time: Optional[Union[int, datetime.datetime, datetime.date, str]] = None,
     internal_only: bool = True,
-    gap_mode: Literal["internal", "all"] = "internal",
+    gap_mode: Literal["internal", "all", "auto"] = "auto",
 ) -> pa.Table:
     """
     针对 PyArrow Table 对象就地执行 K 线缺失检测与 API 补齐，返回补齐后的 PyArrow Table。
@@ -560,7 +656,7 @@ def patch_kline_file(
     end_time: Optional[Union[int, datetime.datetime, datetime.date, str]] = None,
     backup: bool = False,
     internal_only: bool = True,
-    gap_mode: Literal["internal", "all"] = "internal",
+    gap_mode: Literal["internal", "all", "auto"] = "auto",
 ) -> Dict[str, Any]:
     """
     对磁盘上的单个 Parquet / CSV K 线文件进行检查并补齐修复。
