@@ -8,6 +8,8 @@ import urllib.request
 import xml.etree.ElementTree as ET
 import json
 import logging
+import tempfile
+from contextlib import contextmanager
 from collections import defaultdict
 from collections import Counter
 import zipfile
@@ -27,6 +29,23 @@ from .kline_patcher import patch_pyarrow_kline_table, interval_to_milliseconds
 
 # Global constants
 LOGGER = logging.getLogger(__name__)
+
+@contextmanager
+def _atomic_output(destination):
+    with tempfile.NamedTemporaryFile(
+        dir=os.path.dirname(destination),
+        prefix=os.path.basename(destination) + ".",
+        suffix=".part",
+        delete=False,
+    ) as temporary:
+        temporary_path = temporary.name
+    try:
+        yield temporary_path
+        os.replace(temporary_path, destination)
+    finally:
+        if os.path.exists(temporary_path):
+            os.remove(temporary_path)
+
 
 DEFAULT_HEADERS = {
     "klines": {
@@ -647,28 +666,27 @@ class BinanceDataDumper:
                     for name in zip_ref.namelist():
                         if not name.endswith(".csv"):
                             continue
-                        if self._file_format == "parquet":
-                            out_parquet = os.path.join(
-                                str_dir_where_to_save, name[:-4] + ".parquet")
-                            self._convert_zip_entry_to_parquet(
-                                zip_ref=zip_ref,
-                                entry_name=name,
-                                parquet_file_path=out_parquet,
-                                data_type=self._data_type,
-                                ticker=ticker,
-                                interval=self._data_frequency,
-                                asset_class=self._asset_class,
-                                date_obj=date_obj,
-                                timeperiod_per_file=timeperiod_per_file,
-                                enable_patch=self._patch_gaps,
-                            )
-                        else:
-                            out_csv = os.path.join(str_dir_where_to_save, name)
-                            if self._patch_gaps and self._data_type in ("klines", "premiumIndexKlines", "indexPriceKlines", "markPriceKlines"):
+                        output_name = name[:-4] + ".parquet" if self._file_format == "parquet" else name
+                        output_path = os.path.join(str_dir_where_to_save, output_name)
+                        with _atomic_output(output_path) as temporary_path:
+                            if self._file_format == "parquet":
+                                self._convert_zip_entry_to_parquet(
+                                    zip_ref=zip_ref,
+                                    entry_name=name,
+                                    parquet_file_path=temporary_path,
+                                    data_type=self._data_type,
+                                    ticker=ticker,
+                                    interval=self._data_frequency,
+                                    asset_class=self._asset_class,
+                                    date_obj=date_obj,
+                                    timeperiod_per_file=timeperiod_per_file,
+                                    enable_patch=self._patch_gaps,
+                                )
+                            elif self._patch_gaps and self._data_type in ("klines", "premiumIndexKlines", "indexPriceKlines", "markPriceKlines"):
                                 self._convert_zip_entry_to_csv_with_patch(
                                     zip_ref=zip_ref,
                                     entry_name=name,
-                                    csv_file_path=out_csv,
+                                    csv_file_path=temporary_path,
                                     data_type=self._data_type,
                                     ticker=ticker,
                                     interval=self._data_frequency,
@@ -677,7 +695,7 @@ class BinanceDataDumper:
                                     timeperiod_per_file=timeperiod_per_file,
                                 )
                             else:
-                                with zip_ref.open(name) as src, open(out_csv, "wb") as dst:
+                                with zip_ref.open(name) as src, open(temporary_path, "wb") as dst:
                                     while chunk := src.read(1024 * 1024):
                                         dst.write(chunk)
                 # Success
