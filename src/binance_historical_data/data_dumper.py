@@ -46,6 +46,25 @@ def _atomic_output(destination):
             os.remove(temporary_path)
 
 
+def _archive_period_bounds(date_obj, timeperiod_per_file, interval, coverage):
+    """Expected first/last bar of an archive; a side is None when no archive borders it (listing, delisting)"""
+    if not interval:
+        return None, None
+    first_day = date_obj.replace(day=1) if timeperiod_per_file == "monthly" else date_obj
+    next_day = first_day + (relativedelta(months=1) if timeperiod_per_file == "monthly" else datetime.timedelta(days=1))
+    utc = datetime.timezone.utc
+    start = datetime.datetime(first_day.year, first_day.month, first_day.day, tzinfo=utc)
+    end = min(
+        datetime.datetime(next_day.year, next_day.month, next_day.day, tzinfo=utc)
+        - datetime.timedelta(milliseconds=interval_to_milliseconds(interval)),
+        datetime.datetime.now(utc),
+    )
+    return (
+        start if coverage.covers(first_day - datetime.timedelta(days=1)) else None,
+        end if coverage.covers(next_day) else None,
+    )
+
+
 DEFAULT_HEADERS = {
     "klines": {
         12: [
@@ -508,7 +527,8 @@ class BinanceDataDumper:
             is_to_update_existing=False,
     ):
         """Dump data for 1 ticker"""
-        min_start_date = self.get_min_start_date_for_ticker(ticker)
+        coverage = self.get_archive_coverage(ticker)
+        min_start_date = coverage.earliest() or datetime.date.today().replace(day=1)
         LOGGER.debug(
             "Min Start date for ticker %s is %s",
             ticker,
@@ -543,7 +563,7 @@ class BinanceDataDumper:
             ]
         LOGGER.debug("Dates to get data: %d", len(list_dates_cleared))
         list_args = [
-            (ticker, date_obj, timeperiod_per_file)
+            (ticker, date_obj, timeperiod_per_file, coverage)
             for date_obj in list_dates_cleared
         ]
         # 2) Create path to file where to save data
@@ -587,9 +607,12 @@ class BinanceDataDumper:
             self,
             ticker,
             date_obj,
-            timeperiod_per_file="monthly",
+            timeperiod_per_file,
+            coverage: ArchiveCoverage,
     ):
         """Dump data for 1 ticker for 1 date with retry and streaming support"""
+        start_time, end_time = _archive_period_bounds(
+            date_obj, timeperiod_per_file, self._data_frequency, coverage)
         path_folder_suffix = self._get_path_suffix_to_dir_with_data(
             timeperiod_per_file, ticker)
         file_name = self.create_filename(
@@ -633,8 +656,8 @@ class BinanceDataDumper:
                                     ticker=ticker,
                                     interval=self._data_frequency,
                                     asset_class=self._asset_class,
-                                    date_obj=date_obj,
-                                    timeperiod_per_file=timeperiod_per_file,
+                                    start_time=start_time,
+                                    end_time=end_time,
                                     enable_patch=self._patch_gaps,
                                 )
                             elif self._patch_gaps and self._data_type in ("klines", "premiumIndexKlines", "indexPriceKlines", "markPriceKlines"):
@@ -646,8 +669,8 @@ class BinanceDataDumper:
                                     ticker=ticker,
                                     interval=self._data_frequency,
                                     asset_class=self._asset_class,
-                                    date_obj=date_obj,
-                                    timeperiod_per_file=timeperiod_per_file,
+                                    start_time=start_time,
+                                    end_time=end_time,
                                 )
                             else:
                                 with zip_ref.open(name) as src, open(temporary_path, "wb") as dst:
@@ -685,8 +708,8 @@ class BinanceDataDumper:
             ticker: str = "",
             interval: str = "",
             asset_class: str = "um",
-            date_obj = None,
-            timeperiod_per_file: str = "monthly",
+            start_time: datetime.datetime | None = None,
+            end_time: datetime.datetime | None = None,
             enable_patch: bool = True,
     ):
         """Convert Binance CSV inside Zip directly to Parquet using PyArrow streaming parser with gap patching."""
@@ -727,30 +750,14 @@ class BinanceDataDumper:
                 table = pv.read_csv(f, read_options=ro)
 
         if enable_patch and data_type in ("klines", "premiumIndexKlines", "indexPriceKlines", "markPriceKlines") and interval:
-            # 计算当月/当日归档切片在自然周期内的理论起止时间
-            # 只有当文件内已有数据真实跨越该时间段时，智能补齐引擎才会对官方切片截断引起的头尾断层发起精准补齐
-            calc_start_time = None
-            calc_end_time = None
-            if date_obj is not None:
-                step_ms = interval_to_milliseconds(interval) if interval_to_milliseconds else 60_000
-                now_utc = datetime.datetime.now(datetime.timezone.utc)
-                if timeperiod_per_file == "monthly":
-                    calc_start_time = datetime.datetime(date_obj.year, date_obj.month, 1, tzinfo=datetime.timezone.utc)
-                    next_month = calc_start_time + relativedelta(months=1)
-                    calc_end_time = min(next_month - datetime.timedelta(milliseconds=step_ms), now_utc)
-                elif timeperiod_per_file == "daily":
-                    calc_start_time = datetime.datetime(date_obj.year, date_obj.month, date_obj.day, tzinfo=datetime.timezone.utc)
-                    next_day = calc_start_time + datetime.timedelta(days=1)
-                    calc_end_time = min(next_day - datetime.timedelta(milliseconds=step_ms), now_utc)
-
             table = patch_pyarrow_kline_table(
                 table=table,
                 ticker=ticker,
                 interval=interval,
                 asset_class=asset_class,
                 data_type=data_type,
-                start_time=calc_start_time,
-                end_time=calc_end_time,
+                start_time=start_time,
+                end_time=end_time,
                 gap_mode="auto",
             )
 
@@ -766,8 +773,8 @@ class BinanceDataDumper:
             ticker: str = "",
             interval: str = "",
             asset_class: str = "um",
-            date_obj = None,
-            timeperiod_per_file: str = "monthly",
+            start_time: datetime.datetime | None = None,
+            end_time: datetime.datetime | None = None,
     ):
         """Convert Binance CSV inside Zip, apply patch and save as CSV."""
         with zip_ref.open(entry_name) as f:
@@ -807,28 +814,14 @@ class BinanceDataDumper:
             with zip_ref.open(entry_name) as f:
                 table = pv.read_csv(f, read_options=ro)
 
-        calc_start_time = None
-        calc_end_time = None
-        if date_obj is not None:
-            step_ms = interval_to_milliseconds(interval) if interval_to_milliseconds else 60_000
-            now_utc = datetime.datetime.now(datetime.timezone.utc)
-            if timeperiod_per_file == "monthly":
-                calc_start_time = datetime.datetime(date_obj.year, date_obj.month, 1, tzinfo=datetime.timezone.utc)
-                next_month = calc_start_time + relativedelta(months=1)
-                calc_end_time = min(next_month - datetime.timedelta(milliseconds=step_ms), now_utc)
-            elif timeperiod_per_file == "daily":
-                calc_start_time = datetime.datetime(date_obj.year, date_obj.month, date_obj.day, tzinfo=datetime.timezone.utc)
-                next_day = calc_start_time + datetime.timedelta(days=1)
-                calc_end_time = min(next_day - datetime.timedelta(milliseconds=step_ms), now_utc)
-
         table = patch_pyarrow_kline_table(
             table=table,
             ticker=ticker,
             interval=interval,
             asset_class=asset_class,
             data_type=data_type,
-            start_time=calc_start_time,
-            end_time=calc_end_time,
+            start_time=start_time,
+            end_time=end_time,
             gap_mode="auto",
         )
 

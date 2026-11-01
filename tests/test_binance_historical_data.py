@@ -7,6 +7,45 @@ import pyarrow.parquet as pq
 import pytest
 
 from binance_historical_data import BinanceDataDumper
+from binance_historical_data.archive_inventory import ArchiveCoverage
+from binance_historical_data.data_dumper import _archive_period_bounds
+
+D = datetime.date
+UTC = datetime.timezone.utc
+NO_COVERAGE = ArchiveCoverage(frozenset(), frozenset())
+
+
+def months(*pairs):
+    return frozenset(D(year, month, 1) for year, month in pairs)
+
+
+def test_listing_month_skips_head_but_keeps_tail():
+    coverage = ArchiveCoverage(months((2024, 11), (2024, 12)), frozenset())
+    assert _archive_period_bounds(D(2024, 11, 1), "monthly", "1d", coverage) == (
+        None, datetime.datetime(2024, 11, 30, tzinfo=UTC))
+
+
+def test_mid_life_month_keeps_both_bounds():
+    coverage = ArchiveCoverage(months((2022, 3), (2022, 4), (2022, 5)), frozenset())
+    assert _archive_period_bounds(D(2022, 4, 1), "monthly", "8h", coverage) == (
+        datetime.datetime(2022, 4, 1, tzinfo=UTC), datetime.datetime(2022, 4, 30, 16, tzinfo=UTC))
+
+
+def test_relisting_gap_skips_both_sides():
+    coverage = ArchiveCoverage(months((2022, 7), (2023, 3)), frozenset())
+    assert _archive_period_bounds(D(2022, 7, 1), "monthly", "1d", coverage)[1] is None
+    assert _archive_period_bounds(D(2023, 3, 1), "monthly", "1d", coverage)[0] is None
+
+
+def test_monthly_and_daily_archives_border_each_other():
+    coverage = ArchiveCoverage(months((2026, 9)), frozenset({D(2026, 10, 1)}))
+    assert _archive_period_bounds(D(2026, 9, 1), "monthly", "1d", coverage)[1] == datetime.datetime(2026, 9, 30, tzinfo=UTC)
+    assert _archive_period_bounds(D(2026, 10, 1), "daily", "1h", coverage) == (
+        datetime.datetime(2026, 10, 1, tzinfo=UTC), None)
+
+
+def test_non_kline_archive_has_no_bounds():
+    assert _archive_period_bounds(D(2025, 1, 1), "daily", "", NO_COVERAGE) == (None, None)
 
 
 def archive_dumper(tmp_path, file_format, patch_gaps=False):
@@ -58,7 +97,7 @@ def test_archive_interruption_does_not_publish_partial_output(tmp_path, monkeypa
 
     with pytest.raises(KeyboardInterrupt):
         BinanceDataDumper._download_data_for_1_ticker_1_date(
-            dumper, "BTCUSDT", datetime.date(2025, 1, 1), "daily"
+            dumper, "BTCUSDT", datetime.date(2025, 1, 1), "daily", NO_COVERAGE
         )
 
     if existing:
@@ -85,13 +124,32 @@ def test_archive_publishes_completed_output(tmp_path, file_format, empty):
     destination = tmp_path / f"data.{file_format}"
     destination.write_bytes(b"previous complete file")
     date = datetime.date(2025, 1, 1)
-    assert BinanceDataDumper._download_data_for_1_ticker_1_date(dumper, "BTCUSDT", date, "daily") == date
+    assert BinanceDataDumper._download_data_for_1_ticker_1_date(dumper, "BTCUSDT", date, "daily", NO_COVERAGE) == date
     if file_format == "parquet":
         assert pq.read_table(destination).num_rows == (0 if empty else 1)
     else:
         assert destination.read_text() == contents
     assert not list(tmp_path.glob("*.part"))
     assert not (tmp_path / "archive.zip").exists()
+
+
+def test_listing_month_archive_is_patched_without_head_bound(tmp_path, monkeypatch):
+    dumper = archive_dumper(tmp_path, "parquet", patch_gaps=True)
+    dumper._convert_zip_entry_to_parquet.side_effect = BinanceDataDumper._convert_zip_entry_to_parquet
+
+    def download(url, destination):
+        with zipfile.ZipFile(destination, "w") as archive:
+            archive.writestr("data.csv", "1731628800000,1,1,1,1,1,1731715199999,1,1,1,1,0\n")
+        return True
+
+    dumper._download_raw_file.side_effect = download
+    calls = []
+    monkeypatch.setattr("binance_historical_data.data_dumper.patch_pyarrow_kline_table",
+                        lambda **kwargs: calls.append(kwargs) or kwargs["table"])
+    coverage = ArchiveCoverage(months((2024, 11), (2024, 12)), frozenset())
+    BinanceDataDumper._download_data_for_1_ticker_1_date(dumper, "BTCUSDT", D(2024, 11, 1), "monthly", coverage)
+    assert calls[0]["start_time"] is None
+    assert calls[0]["end_time"] == datetime.datetime(2024, 11, 30, 23, tzinfo=UTC)
 
 
 def test_import():
