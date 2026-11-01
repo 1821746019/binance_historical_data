@@ -2,10 +2,8 @@
 # Standard library imports
 import io
 import os
-import re
 import time
 import urllib.request
-import xml.etree.ElementTree as ET
 import json
 import logging
 import tempfile
@@ -25,6 +23,7 @@ import pyarrow.csv as pv
 import pyarrow.parquet as pq
 
 # Local imports
+from .archive_inventory import ArchiveCoverage, list_archive_dates
 from .kline_patcher import patch_pyarrow_kline_table, interval_to_milliseconds
 
 # Global constants
@@ -335,63 +334,19 @@ class BinanceDataDumper:
 
 
 
-    def _get_list_all_available_files(self, prefix=""):
-        """Get all available files from the binance servers"""
-        url = os.path.join(self._base_url, prefix).replace("\\", "/").replace("data/", "?prefix=data/")
-        response = urllib.request.urlopen(url)
-        html_content = response.read().decode('utf-8')
+    def get_archive_coverage(self, ticker) -> ArchiveCoverage:
+        """All monthly and daily archive dates published for ticker"""
+        def dates(timeperiod_per_file):
+            suffix = self._get_path_suffix_to_dir_with_data(timeperiod_per_file, ticker)
+            prefix = "data/" + suffix.replace("\\", "/").strip("/") + "/"
+            return list_archive_dates(prefix, timeperiod_per_file)
 
-        # Extract the BUCKET_URL variable
-        bucket_url_pattern = re.compile(r"var BUCKET_URL = '(.*?)';")
-        match = bucket_url_pattern.search(html_content)
-
-        if match:
-            bucket_url = match.group(1) + "?delimiter=/&prefix=data/" + prefix.replace('\\', '/') + "/"
-
-            # Retrieve the content of the BUCKET_URL
-            bucket_response = urllib.request.urlopen(bucket_url)
-            bucket_content = bucket_response.read().decode('utf-8')
-
-            # Parse the XML content and extract all <Key> elements
-            root = ET.fromstring(bucket_content)
-            # Automatically retrieve the namespace
-            namespace = {'s3': root.tag.split('}')[0].strip('{')}
-            keys = [element.text for element in root.findall('.//s3:Key', namespace)]
-            return keys
-        else:
-            raise ValueError("BUCKET_URL not found")
+        monthly = frozenset() if self._data_type in self.ONLY_DAILY_DATA_TYPES else dates("monthly")
+        return ArchiveCoverage(monthly=monthly, daily=dates("daily"))
 
     def get_min_start_date_for_ticker(self, ticker):
         """Get minimum start date for ticker"""
-        path_folder_prefix = self._get_path_suffix_to_dir_with_data("monthly", ticker)
-        min_date = datetime.datetime(datetime.datetime.today().year, datetime.datetime.today().month, 1)
-
-        try:
-            date_found = False
-
-            files = self._get_list_all_available_files(prefix=path_folder_prefix)
-            for file in files:
-                date_str = file.split('.')[0].split('-')[-2:]
-                date_str = '-'.join(date_str)
-                date_obj = datetime.datetime.strptime(date_str, '%Y-%m')
-                if date_obj < min_date:
-                    date_found = True
-                    min_date = date_obj
-
-            if not date_found:
-                path_folder_prefix = self._get_path_suffix_to_dir_with_data("daily", ticker)
-                files = self._get_list_all_available_files(prefix=path_folder_prefix)
-                for file in files:
-                    date_str = file.split('.')[0].split('-')[-3:]
-                    date_str = '-'.join(date_str)
-                    date_obj = datetime.datetime.strptime(date_str, '%Y-%m-%d')
-                    if date_obj < min_date:
-                        min_date = date_obj
-
-        except Exception as e:
-            LOGGER.error('Min date not found: ', e)
-
-        return min_date.date()
+        return self.get_archive_coverage(ticker).earliest() or datetime.date.today().replace(day=1)
 
     def get_local_dir_to_data(self, ticker, timeperiod_per_file):
         """Path to directory where ticker data is saved
