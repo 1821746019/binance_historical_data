@@ -106,6 +106,23 @@ def test_detect_kline_gaps_internal():
     assert gaps[0] == (base_ts + 2 * step, base_ts + 3 * step)
 
 
+@pytest.mark.filterwarnings("error::FutureWarning")
+def test_vision_fallback_fills_gap_when_api_returns_nothing():
+    base_ts = 1704067200000
+    step = 300_000
+    df = pd.DataFrame({"open_time": [base_ts, base_ts + 3 * step], "close": [1.0, 1.0]})
+    vision = pd.DataFrame({"open_time": [base_ts + 2 * step, base_ts + step], "close": [2.0, 2.0]})
+    with (
+        unittest.mock.patch("binance_historical_data.kline_patcher.fetch_klines_range",
+                            return_value=pd.DataFrame(columns=["open_time", "close"])),
+        unittest.mock.patch("binance_historical_data.kline_patcher.fetch_klines_from_vision_daily", return_value=vision),
+    ):
+        repaired, report = fill_kline_gaps(df, "BTCUSDT", "5m")
+    assert repaired["open_time"].tolist() == [base_ts + i * step for i in range(4)]
+    assert report["filled_bars_count"] == 2
+    assert not report["unfillable_gaps"]
+
+
 def test_detect_kline_gaps_with_boundaries():
     base_ts = 1704067200000
     step = 300_000  # 5m

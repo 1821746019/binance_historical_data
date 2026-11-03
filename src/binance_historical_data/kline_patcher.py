@@ -532,7 +532,8 @@ def fill_kline_gaps(
                 session=session,
             )
             if not df_vision.empty:
-                df_gap = pd.concat([df_gap, df_vision], ignore_index=True).drop_duplicates(subset=["open_time"]).sort_values("open_time").reset_index(drop=True)
+                combined = df_vision if df_gap.empty else pd.concat([df_gap, df_vision], ignore_index=True)
+                df_gap = combined.drop_duplicates(subset=["open_time"]).sort_values("open_time").reset_index(drop=True)
 
         if not df_gap.empty:
             fetched_dfs.append(df_gap)
